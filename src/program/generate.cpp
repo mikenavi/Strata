@@ -152,6 +152,44 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <set>
 #include <vector>
 
+// logprobs=K / allowed=...: one `LP` line for the token just emitted, from `ver`'s head
+// logits for the window row it came from (before sampling, penalties and temperature).
+// Format matches the SYCL port's LP line so one server-side reader serves both.
+void emit_lp_line(const strata::core::Verifier& ver, int t, int32_t token, int k,
+                  const std::vector<int32_t>& allowed, int slot = -1) {
+    if (k < 0) return;
+    // One complete stdio write: batch/prompt worker output may be interleaved.
+    std::ostringstream line;
+    if (slot < 0) line << "LP "; else line << "BLP " << slot << ' ';
+    static thread_local std::vector<float> row;
+    row.resize((size_t) ver.vocab());
+    auto unavailable = [&] { line << "nan\n"; const auto text = line.str(); std::fwrite(text.data(), 1, text.size(), stdout); };
+    if (allowed.size() > 256 || token < 0 || (size_t) token >= row.size() || !ver.copy_logits(t, row.data())) { unavailable(); return; }
+    float mx = -INFINITY;
+    for (const float v : row) { if (std::isnan(v)) { unavailable(); return; } mx = std::max(mx, v); }
+    if (!std::isfinite(mx)) { unavailable(); return; }
+    for (int32_t id : allowed) if (id < 0 || (size_t) id >= row.size()) { unavailable(); return; }
+    double sum = 0;
+    for (float v : row) sum += std::exp((double) v - mx);
+    const double lse = (double) mx + std::log(sum);
+    line.precision(9);
+    line << (double) row[(size_t) token] - lse;
+    if (!allowed.empty()) {
+        for (int32_t id : allowed) if (id != token) line << ' ' << id << ':' << (double) row[(size_t) id] - lse;
+    } else if (k > 0) {
+        static thread_local std::vector<int32_t> order;
+        order.resize(row.size());
+        for (size_t i = 0; i < row.size(); ++i) order[i] = (int32_t) i;
+        const int count = std::min<int>(std::min(k, 20), (int) row.size());
+        std::partial_sort(order.begin(), order.begin() + count, order.end(),
+                         [&](int32_t a, int32_t b) { return row[a] > row[b]; });
+        for (int i = 0; i < count; ++i) line << ' ' << order[i] << ':' << (double) row[order[i]] - lse;
+    }
+    line << '\n';
+    const auto text = line.str();
+    std::fwrite(text.data(), 1, text.size(), stdout);
+}
+
 namespace {
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
 // pinning a large arena into two CUDA contexts leaves WDDM refusing every later allocation (the 5080 + 3090 rig);
@@ -11180,7 +11218,7 @@ int main(int argc, char** argv) {
                     slots_all += remote_experts[(size_t) r].resident();
                     mib_all += (int64_t) (remote_experts[(size_t) r].gib() * 1024.0);
                 }
-            std::printf("INFO logit_bias=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
+            std::printf("INFO logit_bias=1 logprobs=1 context=%lld kv=%s kv_resident=%lld expert_slots=%lld expert_cache_mib=%lld "
                         "expert_slots_primary=%lld expert_cache_primary_mib=%lld spec=%d "
                         "mtp_max=%d lookup=%d vram_free_mib=%lld cvec=%s arena_mib=%lld pool_workers=%d pcie_frac=%.2f "
                         "spec_min_p=%.2f conversation_cache_mib=%lld conversation_cache_slots=%d "
@@ -11206,7 +11244,7 @@ int main(int argc, char** argv) {
                         strata::prefill::Prefill::pipe_setting(),
                         o.batch > 0 ? (" batch_slots=" + std::to_string(o.batch) +
                                        " slot_cache=" + std::to_string(o.prompt_cache > 0 ? 1 : 0) +
-                                       " batch_groups=" + std::to_string(o.batch_groups)).c_str() : "");
+                                       " batch_groups=" + std::to_string(o.batch_groups) + " slot_logprobs=1").c_str() : "");
         }
         // issue #29: a request whose heartbeat (tokens, prompt chunks, verify windows) stops for this long is stuck on
         // a flag nobody will raise - end the engine with where it was, so the server starts it again instead of the
@@ -11422,6 +11460,8 @@ int main(int argc, char** argv) {
         // ---- --batch: the slots of the batch windows
         struct BSlot {
             bool active = false, stop = false;
+            int logprobs = -1;
+            std::vector<int32_t> allowed;
             int32_t x = 0;                 ///< the token the next window feeds (not yet in the slot's state)
             std::array<int32_t, strata::kernels::kVerifyMaxT> draft{}; ///< the slot's next MTP proposal
             bool draft_ready = false;
@@ -11746,6 +11786,7 @@ int main(int argc, char** argv) {
                     const int32_t y = outb[first[t] + j];
                     sl.ids.push_back(tok[first[t] + j]);
                     std::printf("BT %d %d\n", b, (int) y);
+                    emit_lp_line(ver, first[t] + j, y, sl.logprobs, sl.allowed, b);
                     ++sl.produced;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
@@ -11926,6 +11967,7 @@ int main(int argc, char** argv) {
                     }
                     const int32_t y = outb[t];
                     std::printf("BT %d %d\n", gi * GS + t, (int) y);
+                    emit_lp_line(vk, t, y, sl.logprobs, sl.allowed, gi * GS + t);
                     ++sl.produced;
                     ++bt_rows;
                     ++pipe_rows;
@@ -12407,6 +12449,11 @@ int main(int argc, char** argv) {
             std::string req_bias_text;
             bool req_bias_present = false;
             int req_cvec = 1;   // cvec=0|1: a loaded control vector for this request (on when absent)
+            // logprobs=K (0..20): after each "T id" an "LP logprob id:logprob ..." line.
+            // -1 (absent) = no LP lines, so a server that never asks sees today's output.
+            int req_logprobs = -1;
+            // allowed=a,b,c: with logprobs, print only these token ids (renormalized server-side).
+            std::vector<int32_t> req_allowed;
             // ckpt=0: a one-shot call whose turn no later request extends.  No checkpoint at its last turn boundary
             // (so no split there) nor every --prompt-cache-every tokens, and its session is neither continued nor
             // parked after it.  It still resumes from a checkpoint it matches, and still saves the system-prompt root
@@ -12446,6 +12493,18 @@ int main(int argc, char** argv) {
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "logprobs") req_logprobs = std::atoi(tok.c_str() + eq + 1);
+                    else if (key == "allowed") {
+                        const std::string csv = tok.substr(eq + 1);
+                        size_t p = 0;
+                        while (p < csv.size()) {
+                            const size_t c = csv.find(",", p);
+                            const std::string one = csv.substr(p, c == std::string::npos ? std::string::npos : c - p);
+                            if (!one.empty()) req_allowed.push_back((int32_t) std::atoi(one.c_str()));
+                            if (c == std::string::npos) break;
+                            p = c + 1;
+                        }
+                    }
                     else if (key == "min_p") req_min_p = fv;
                     else if (key == "penalty_last_n") req_penalty_last_n = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "penalty_repeat") req_penalty_repeat = fv;
@@ -14894,6 +14953,7 @@ int main(int argc, char** argv) {
                     bool eos = false;
                     for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
+                        emit_lp_line(V1(A), i, outp[(size_t) i], req_logprobs, req_allowed);
                         strata::core::progress_beat();
                         ++produced_n;
                         if (o.suffix_draft > 0) sfx.append(outp[(size_t) i]);
@@ -15314,6 +15374,7 @@ int main(int argc, char** argv) {
                 bool eos = false;
                 for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                    emit_lp_line(ver, i, outv[(size_t) i], req_logprobs, req_allowed);
                     strata::core::progress_beat();
                     ++produced_n;
                     if (sfx_on) sfx.append(outv[(size_t) i]);
@@ -15596,6 +15657,8 @@ int main(int argc, char** argv) {
                     sl.p = p;
                     sl.produced = 1;
                     sl.max_new = admit_max_new;
+                    sl.logprobs = req_logprobs;
+                    sl.allowed = req_allowed;
                     sl.t0 = Clock::now();
                     sl.ids = live;
                     if (batch_mtp) {
