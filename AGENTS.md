@@ -1,3 +1,16 @@
+# mikenavi fleet fork
+
+This branch is the Strata application/release component. Read README.fleet.md and local/source.lock.json first.
+The local features are committed source, not deployment-time patches. Preserve
+feature regressions when updating upstream. Verify source identities and run
+applicable CPU tests before publishing a new fleet tag; GPU/backend and workload
+qualification are separate. Weights, host profiles, credentials and caches stay
+outside this repository. Build/deploy exact commits, not a moving branch.
+For Strata, the application components.lock.json selects the native engine commit;
+the stock upstream installer/feed does not select the custom engine automatically.
+
+## Upstream guidance
+
 # AGENTS.md
 
 Version 0.2.6, engine 0.1.51. The public model families are DeepSeekV4.1-Flash-1017,

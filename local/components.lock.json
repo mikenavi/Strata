@@ -4,7 +4,7 @@
   "application_version": "0.2.6",
   "control_version": "0.1.51",
   "engine_repository": "https://github.com/mikenavi/Strata.git",
-  "engine_commit": "b58a897a9113d4acc9fc08a75d7044b9296ae4fb",
+  "engine_commit": "db7c925bfc3a821ce59ee705cb1c79951eef9c99",
   "engine_upstream_base": "1aff6d14117b88171fcfcec8f2b55fdc47f2b165",
   "engine_version": "0.1.50",
   "ggml_revision": "3cf03257f219afbe7334045ff7c6a06ac68c627d",
