@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "upstream": "https://github.com/Niko1221/Strata",
+  "upstream_base": "1aff6d14117b88171fcfcec8f2b55fdc47f2b165",
+  "component": "strata-native-engine",
+  "product_files": {
+    "CMakeLists.txt": "ddae7e3e42ac0126cc8b2b2b71c07d7dd14d9aa9f891dbb1c0a91b2ab7c732a4",
+    "include/strata/core/conversation_cache.hpp": "ca05c75d57fadf049630842da618c24c3498dc9cf062d6489dd5fc9411d2cd7a",
+    "include/strata/program/native_cache.hpp": "84f5f1fa5bd3ae7d4f3c5c73487034876d7f830647da927e24db6d6dde87e10a",
+    "src/core/conversation_copy.hpp": "2c9af900b59acff550824a52242ee1df8e57750fe6cd9532e52f6c2b85bce4cb",
+    "src/program/generate.cpp": "2fce5e10c36ed0861b05b174eaedb4bfb75f5d21f0ee68fe69b5744b1f3c0780",
+    "src/program/native_cache_test.cpp": "5bbe48e2bf6fdd38e334ae4f257f30815e4fd2d3a6bd1b704154a80f4eb755bc",
+    "src/program/native_cache_eligibility_test.cpp": "0f0ed4d85e0af6a2d429291dacd05231b23d4b42e801c56d97d81cc9ae4b1c63",
+    "src/program/native_eligibility_driver_test.py": "f9ef462f096c64d8aade3e65a71f8780c7d27818180b2630c8f89db1c3c0bc34",
+    "src/program/native_optional_save_test.py": "816c6a584773be2fe76dbf3fe7bf3bda15aad30c9f9bf43133a81ec52784df89"
+  },
+  "source_only_export": true,
+  "target": "Linux gfx1151 with an external pinned ROCm toolchain",
+  "qualification": "Code bytes match a previously built artifact; this Git export is not a fresh GPU or workload qualification."
+}
