@@ -29,6 +29,7 @@ struct ConversationCheckpoint {
     // from, so retention never evicts it (conv_cache.hpp) and a parked conversation holding it stays parked.  A run-time
     // mark only: it is not in the session file, a request that pins the same prefix again sets it.
     bool pinned = false;
+    bool native_soft = false; // optional native checkpoint/copy; runtime-only, never a hard pin
     // --prefill-pipe on a layer split: the plan a prompt segment [from, to) is read in - its chunk (0: none), the loan
     // its buffers were laid out for (which experts the prompt reads in place and which it streams: that sets bits
     // too), the pipe value it was planned with, whether it is one chunk and whether the plan changed the buffers'
@@ -110,6 +111,7 @@ inline ConversationCheckpointSplit conversation_checkpoints_split(std::vector<Co
         for (size_t k = 0; k < stages; ++k) {
             ConversationCheckpoint part;
             part.ids = c.ids; part.imgs = c.imgs; part.used = c.used; part.pinned = c.pinned;
+            part.native_soft = c.native_soft;
             out.parts[k].push_back(std::move(part));
         }
     }
@@ -263,6 +265,20 @@ public:
             for (const auto& c : e.checkpoints) consider(c, false);
         }
         return best;
+    }
+
+    // Observation only: no running state is mounted at this length. The scheduler must
+    // actually read to it before saving a checkpoint. Images and steering mismatches are excluded.
+    template<class Token>
+    int64_t observed_text_lcp(const std::vector<Token>& prompt, bool cvec) const {
+        size_t longest = 0;
+        for (const auto& e : entries_) {
+            if (e.cvec != cvec || !e.live.imgs.empty()) continue;
+            size_t n = 0;
+            while (n < e.live.ids.size() && n < prompt.size() && e.live.ids[n] == prompt[n]) ++n;
+            longest = std::max(longest, n);
+        }
+        return (int64_t) longest;
     }
 
     SavedConversation take(size_t index) {

@@ -79,6 +79,7 @@
 #include "strata/program/batch_read.hpp"
 #include "strata/program/logits_selection.hpp"
 #include "strata/program/conv_cache.hpp"
+#include "strata/program/native_cache.hpp"
 #include "strata/program/split_rules.hpp"
 #include "strata/prefill/share_rules.hpp"
 #include "strata/platform/host_limits.hpp"
@@ -749,6 +750,7 @@ struct Options {
     bool session_save_reclaim = false;
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
+    int64_t prompt_cache_native_mib = 0; // opt-in chain retention + observed LCP, per-chain admission ceiling
     bool prompt_cache_tail = false;   // optional extra checkpoint at an existing near-tail chunk boundary
     bool prompt_cache_spread = false;   ///< --prompt-cache-spread: keep checkpoints spread back from the end, not the latest
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
@@ -923,6 +925,8 @@ void usage() {
                  "                       (stage 0 runs the next window while stage 1 verifies this one); docs/MULTI_GPU.md\n"
                  "  --trim-stage-weights an explicit --layer-split: each GPU loads only its own layers' dense weights\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
+                 "  --prompt-cache-native MiB  --serve, CUDA/HIP single GPU text: retain chains and learn\n"
+                 "                       observed forks; chain byte admission ceiling (0 = off). No new hard pins.\n"
                  "  --prompt-cache-tail  --serve, single GPU: one extra checkpoint near the prompt's end, at an existing\n"
                  "                       chunk boundary (default off; requires --prompt-cache and --prompt-cache-every > 0)\n"
                  "  --prompt-cache-spread  --serve: keep the checkpoints spread back from the conversation's end (dense\n"
@@ -1757,7 +1761,7 @@ public:
     explicit CheckpointPool(bool on, size_t cap = 2) : on_(on), cap_(cap) {}
     bool on() const { return on_; }
     void give(ConvCheckpoint&& c) {
-        if (!on_ || c.gdn.empty()) return;
+        if (!on_ || c.gdn.empty() || c.native_soft) return;
         clear_marks(c);
         std::lock_guard<std::mutex> lk(mu_);
         if (free_.size() < cap_) free_.push_back(std::move(c));
@@ -1781,7 +1785,7 @@ public:
     }
 private:
     static void clear_marks(ConvCheckpoint& c) {
-        c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false;
+        c.ids.clear(); c.imgs.clear(); c.used = 0; c.pinned = false; c.native_soft = false;
         for (ConvCheckpoint& part : c.stage_parts) clear_marks(part);
     }
     bool on_;
@@ -2664,6 +2668,14 @@ int main(int argc, char** argv) {
             else if (a == "--session-min-free-mib") o.session_min_free_mib = number;
             else if (a == "--memory-limit-mib") o.memory_limit_mib = number;
             else o.conversation_cache_slots = (int) number;
+        }
+        else if (a == "--prompt-cache-native") {
+            o.prompt_cache_native_mib = std::clamp<int64_t>(std::atoll(next("--prompt-cache-native")), 0, 1048576);
+            if (o.prompt_cache_native_mib > 0 &&
+                !strata::program::native_cache::supported_backend(strata::program::native_cache::build_backend)) {
+                std::fprintf(stderr, "--prompt-cache-native requires the CUDA/HIP backend\n");
+                return 1;
+            }
         }
         else if (a == "--prompt-cache-tail") o.prompt_cache_tail = true;
         else if (a == "--prompt-cache-spread") o.prompt_cache_spread = true;
@@ -9590,7 +9602,9 @@ int main(int argc, char** argv) {
             }
             const auto t0 = Clock::now();
             try {
-                const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib * 1024 * 1024;
+                const uint64_t floor = strata::program::native_cache::parking_floor(
+                    (uint64_t) o.conversation_cache_min_free_mib << 20,
+                    o.prompt_cache_native_mib > 0 && o.prompt_cache > 0, multi_gpu, !live_imgs.empty());
                 const size_t retained = reuse.bytes() + stage_retained;
                 const size_t additional = estimate > retained ? estimate - retained : 0;
                 // The physical-RAM gate: the incoming snapshot has to fit beside the floor.  make_room()
@@ -9724,7 +9738,21 @@ int main(int argc, char** argv) {
             return false;
         };
         StageThreads ckpt_threads;   // STRATA_CKPT_THREADS: the later stages' parts of a checkpoint (started on first use)
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
+        const uint64_t native_chain_bytes = (uint64_t) o.prompt_cache_native_mib << 20;
+        auto native_room = [&]() -> uint64_t {
+            const auto available = strata::core::available_host_bytes();
+            // A candidate never lowers the 8 GiB floor, even if the parking flag is smaller.
+            return strata::program::native_cache::room_above_floor(available,
+                (uint64_t) o.conversation_cache_min_free_mib << 20);
+        };
+        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false,
+                                 bool optional = false) -> bool {
+            try {
+            // Optional snapshots use a fresh local owner and a transactional publication path.
+            // Mandatory saves retain upstream error handling and retention semantics.
+            if (optional && (parts != nullptr || as_tail ||
+                !strata::program::native_cache::text_eligible(native_chain_bytes > 0, multi_gpu, !req_imgs.empty())))
+                return true;
             ckpt_why.clear();
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
@@ -9733,7 +9761,25 @@ int main(int argc, char** argv) {
                     if (!as_tail && L == tail_ckpt_len) tail_ckpt_len = -1;   // a periodic one lands here: a normal item now
                     return true;
                 }
-            ConvCheckpoint c = parts == nullptr ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
+            if (optional) {
+                strata::core::ConversationStateSizes z;
+                std::string why;
+                uint64_t need = UINT64_MAX;
+                if (strata::core::conversation_session_sizes(g, ss, z, why)) {
+                    const uint64_t q = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0);
+                    const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
+                    const uint64_t meta = (uint64_t) L * sizeof(int32_t) + 4096;
+                    if (z.gdn <= UINT64_MAX - z.ple && z.gdn + z.ple <= UINT64_MAX - meta &&
+                        (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple - meta) / q))
+                        need = z.gdn + z.ple + q * per + meta;
+                }
+                if (!strata::program::native_cache::admits(checks, need, native_chain_bytes, native_room())) {
+                    if (ckpt_trace) std::fprintf(stderr, "strata trace: native checkpoint at %lld skipped: byte/RAM guard\n",
+                                                (long long) L);
+                    return true;
+                }
+            }
+            ConvCheckpoint c = parts == nullptr && !optional ? ckpt_pool.take() : ConvCheckpoint{};   // (STRATA_CKPT_POOL)
             c.ids.assign(cur.begin(), cur.begin() + L);
             c.imgs = imgs_below(req_imgs, L);
             if (parts != nullptr) {
@@ -9836,6 +9882,20 @@ int main(int argc, char** argv) {
                                  (long long) L, sync_ms, save_ms, stages.size() + 1);
                 }
             }
+            if (optional) {
+                c.native_soft = true;
+                c.used = check_clock + 1;
+                if (!strata::program::native_cache::publish_optional(checks, std::move(c), o.prompt_cache,
+                        native_chain_bytes, native_room(), o.prompt_cache_spread, tail_ckpt_len)) {
+                    if (ckpt_trace) std::fprintf(stderr, "strata trace: native checkpoint at %lld skipped: publication budget/pins\n",
+                                                (long long) L);
+                    return true;
+                }
+                ++check_clock;
+                if (L == tail_ckpt_len) tail_ckpt_len = -1;
+                return true;
+            }
+            c.native_soft = false;
             c.used = ++check_clock;
             if (seg_plan.chunk > 0 && L > seg_plan.from && L < seg_plan.to) c.plan = seg_plan;   // inside a planned segment
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
@@ -9881,6 +9941,8 @@ int main(int argc, char** argv) {
                 ckpt_pool.give(std::move(checks[victim]));   // (STRATA_CKPT_POOL; else nothing)
                 checks.erase(checks.begin() + (std::ptrdiff_t) victim);
             }
+            if (strata::program::native_cache::text_eligible(native_chain_bytes > 0, multi_gpu, !req_imgs.empty()))
+                strata::program::native_cache::trim_soft(checks, native_chain_bytes);
             if (ckpt_trace && checks.size() < before_evict) {
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - te0).count();
                 req_times.evict_ms += ms;
@@ -9888,6 +9950,13 @@ int main(int argc, char** argv) {
                              before_evict - checks.size(), ms);
             }
             return true;
+            } catch (const std::bad_alloc&) {
+                if (!optional) throw;
+                // Nothing was published: local partial payloads have unwound, existing pins/state survive.
+                if (ckpt_trace) std::fprintf(stderr, "strata trace: native checkpoint at %lld skipped: allocation failed\n",
+                                            (long long) L);
+                return true;
+            }
         };
         // STRATA_SPLIT_MTP_BATCH=1 (default off): the layer split's drafter is on the last stage, so E-9 (Prefill::draft_kv)
         // runs there, on the Prefill that ran the chunk, instead of the drafter's own per-8-row pass.  The drafts' K/V
@@ -12542,6 +12611,8 @@ int main(int argc, char** argv) {
                 wait_before[(size_t) r] = remote_experts[(size_t) r].ms_wait();
             }
             cur = ids;
+            const bool native_text = strata::program::native_cache::text_eligible(
+                native_chain_bytes > 0, multi_gpu, !req_imgs.empty()) && o.prompt_cache > 0 && req_ckpt;
             const Clock::time_point r0 = Clock::now();
             const int64_t streamed0 = sp.chain_experts_streamed();   // the DONE line's experts_streamed= is the difference
             // ---- where this request starts reading: the live session, or a checkpoint, whose tokens AND pictures are
@@ -12620,6 +12691,27 @@ int main(int argc, char** argv) {
                              n_checks == 1 ? "" : "s", n_parked, n_parked == 1 ? "" : "s", n_slots,
                              n_slots == 1 ? "" : "s", n_running, n_running == 1 ? "" : "s");
             }
+            // Token metadata is read at the same quiescent boundary as native source selection.
+            // live / slot.ids contain CONSUMED tokens, never the last merely emitted token.
+            int64_t observed_lcp = 0;
+            if (native_text) {
+                if (native_room() == 0) {
+                    size_t dropped = strata::program::native_cache::trim_soft(checks, 0);
+                    for (auto& sl : bs) dropped += strata::program::native_cache::trim_soft(sl.checks, 0);
+                    if (trace && dropped) std::fprintf(stderr,
+                        "strata trace: native RAM pressure released %zu optional checkpoints\n", dropped);
+                }
+                auto observe = [&](const auto& tokens) {
+                    observed_lcp = std::max(observed_lcp, strata::program::native_cache::lcp(tokens, ids));
+                };
+                if (want_cvec == cvec_cached) {
+                    if (live_ok && live_imgs.empty()) observe(live);
+                    for (const auto& c : checks) if (c.imgs.empty()) observe(c.ids);
+                }
+                for (const auto& sl : bs)
+                    if ((sl.active || sl.cached) && !sl.tainted && !sl.img && sl.cvec == want_cvec) observe(sl.ids);
+                observed_lcp = std::max(observed_lcp, conversations.observed_text_lcp(ids, want_cvec));
+            }
             int64_t resume = 0;
             bool from_live = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
@@ -12667,7 +12759,7 @@ int main(int argc, char** argv) {
                     const bool idle_source = !sl.active && sl.cached;
                     // (an active slot only where the drafter's rows come along or are not drafted from: the copy
                     // takes the main layers' cells, so the main drafter would keep another conversation's below it)
-                    const bool active_source = sl.active && !sl.tainted && slot_ckpt_move_env() &&
+                    const bool active_source = sl.active && !sl.tainted && (slot_ckpt_move_env() || native_text) &&
                                                (!use_mtp || batch_mtp || admit_slot >= 0);
                     if (sl.cvec != want_cvec || !(idle_source || active_source)) continue;
                     if (idle_source && (int64_t) sl.ids.size() > std::max(resume, slot_tokens) && starts_with(sl.ids, {})) {
@@ -12831,7 +12923,8 @@ int main(int argc, char** argv) {
                         resume_plan = bs[(size_t) slot_source].partial_plan;
                         resume_plan_at = slot_tokens;
                         resume_plan_end = resume_plan.to;
-                        for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
+                        if (native_text) checks = std::move(bs[(size_t) slot_source].checks);
+                        else for (const ConvCheckpoint& c : bs[(size_t) slot_source].checks) checks.push_back(c);
                         bs[(size_t) slot_source].partial = false;
                         bs[(size_t) slot_source].partial_plan = {};
                     }
@@ -12852,6 +12945,13 @@ int main(int argc, char** argv) {
                         checks.back().used = ++check_clock;
                     } else {
                         live = bs[(size_t) slot_source].ids;
+                    }
+                    if (native_text) {
+                        const size_t added = strata::program::native_cache::handoff(checks,
+                            bs[(size_t) slot_source].checks, live, slot_tokens, o.prompt_cache,
+                            native_chain_bytes, native_room());
+                        if (trace) std::fprintf(stderr, "strata trace: native slot->main retained=%zu chain=%zu bytes=%llu\n",
+                            added, checks.size(), (unsigned long long) strata::program::native_cache::bytes(checks));
                     }
                     live_imgs.clear();
                     resume = slot_tokens;
@@ -12882,7 +12982,13 @@ int main(int argc, char** argv) {
                 // the donor's checkpoints on this prompt's path, copied: the donor keeps its own (the one at
                 // parked.tokens is mounted below, as for any checkpoint resume)
                 checks.clear();
-                for (const ConvCheckpoint& c : donor->checkpoints)
+                if (native_text) {
+                    // The mounted state is mandatory; earlier optional copies share the same byte/RAM gates as slots.
+                    for (const ConvCheckpoint& c : donor->checkpoints)
+                        if ((int64_t) c.ids.size() == parked.tokens && starts_with(c.ids, c.imgs)) checks.push_back(c);
+                    strata::program::native_cache::handoff(checks, donor->checkpoints, ids, parked.tokens,
+                        o.prompt_cache, native_chain_bytes, native_room());
+                } else for (const ConvCheckpoint& c : donor->checkpoints)
                     if ((int64_t) c.ids.size() <= parked.tokens && starts_with(c.ids, c.imgs)) checks.push_back(c);
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == parked.tokens) { live = c.ids; live_imgs = c.imgs; }
@@ -13548,7 +13654,11 @@ int main(int argc, char** argv) {
                         sl.partial_from0 = read_from == 0 || resumed_from0;
                         if (planned) sl.partial_plan = plan;   // the resend reads the rest in these chunks
                         sl.cvec = cvec_cached;
-                        for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
+                        if (native_text) {
+                            // The main read ends here; transfer ownership without a transient state copy.
+                            sl.checks = std::move(checks);
+                            strata::program::native_cache::prune(sl.checks, sl.ids, q);
+                        } else for (const ConvCheckpoint& c : checks)   // the root / periodic checkpoints of this read
                             if ((int64_t) c.ids.size() <= q && std::equal(c.ids.begin(), c.ids.end(), ids.begin(),
                                     [](int32_t x, int64_t y) { return (int64_t) x == y; }))
                                 sl.checks.push_back(c);
@@ -14070,10 +14180,21 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata serve: pin=%lld: the cache has no checkpoint there to pin (it resumed from "
                                  "%lld)\n", (long long) req_pin, (long long) read_from);
             }
+            const int64_t observed_at = native_text && reread_to <= 0 && native_room() > 0
+                ? strata::program::native_cache::observed_cut(read_from, n, observed_lcp) : -1;
+            if (native_text && trace)
+                std::fprintf(stderr, "strata trace: native N=%lld L=%lld R=%lld observed_cut=%lld chain=%zu bytes=%llu\n",
+                    (long long) n, (long long) observed_lcp, (long long) read_from, (long long) observed_at,
+                    checks.size(), (unsigned long long) strata::program::native_cache::bytes(checks));
             std::vector<int64_t> cuts = {reread_to, root_at, message_at, turn_at, n - 1};
+            if (observed_at > 0) cuts.push_back(observed_at);
             if (pin_at >= 0) {
                 cuts.push_back(pin_at);
                 std::sort(cuts.begin(), cuts.end());   // the skipped -1s first, n - 1 still last
+            }
+            if (observed_at > 0) {
+                std::sort(cuts.begin(), cuts.end());
+                cuts.erase(std::unique(cuts.begin(), cuts.end()), cuts.end());
             }
             int64_t at = read_from;
             // STRATA_ADMIT_MERGE_FIRST: the last part, when it goes through the windows, leaves its last tokens (up to
@@ -14084,7 +14205,7 @@ int main(int argc, char** argv) {
             int64_t merge_at = -1;
             auto merge_from = [&](int64_t a0, int64_t to) -> int64_t {
                 if (!admit_merge_first_env() || admit_slot < 0 || max_new != 1 || batch_mtp || pipe) return -1;
-                if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at) return -1;
+                if (to != n - 1 || to == turn_at || to == root_at || to == message_at || to == pin_at || to == observed_at) return -1;
                 if (!req_imgs.empty() || kvg.on || peer.valid() || remote_caches || remote_opt || fs_swap) return -1;
                 if (std::getenv("STRATA_LOGPOS") != nullptr) return -1;
                 if (host_res.empty() || !pending.empty() ||
@@ -14157,8 +14278,11 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
-                    !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
+                const bool ordinary_at = to == turn_at || to == root_at || to == message_at || to == pin_at;
+                const bool learned_at = strata::program::native_cache::capture_ready(to, observed_at, sp_ok, pp_exact);
+                if ((ordinary_at || learned_at) &&
+                    !checkpoint_at(to, nullptr, to == message_at && !learned_at && to != turn_at && to != root_at && to != pin_at,
+                                   learned_at && !ordinary_at)) {
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
                     return 1;
                 }
@@ -15521,6 +15645,12 @@ int main(int argc, char** argv) {
                         } else {
                             sl.checks.push_back(*best);
                         }
+                    }
+                    if (native_text && !sl.img) {
+                        const size_t added = strata::program::native_cache::handoff(sl.checks, checks, live,
+                            (int64_t) live.size(), o.prompt_cache, native_chain_bytes, native_room());
+                        if (trace) std::fprintf(stderr, "strata trace: native main->slot retained=%zu chain=%zu bytes=%llu\n",
+                            added, sl.checks.size(), (unsigned long long) strata::program::native_cache::bytes(sl.checks));
                     }
                     const auto tc4 = Clock::now();
                     std::fprintf(stderr, "strata batch: slot %d takes %lld tokens (copied in %.1f ms)\n", admit_slot,
