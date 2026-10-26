@@ -1,7 +1,8 @@
 # mikenavi Strata application and release source
 
-Application0.2.6 and native engine0.1.50 are independent components in the same
-upstream project. mikenavi/stable contains the application with stable watcher
+Application0.2.6 and the native engine are independent components in the same
+upstream project. Both source branches include upstream4b9e05a2. The custom native
+CMake project is0.1.51; the unchanged upstream Qwen package version is0.1.50. mikenavi/stable contains the application with stable watcher
 birth stamps and native probability/completion/tokenizer APIs. mikenavi/engine
 contains the native cache and probability changes. local/components.lock.json
 pins an exact engine commit; the release assembler never applies loose patches.
@@ -25,8 +26,10 @@ containers must select the custom native binary explicitly.
 
 Read release.json to identify both source commits. A combined app version is
 not an engine version. Keep custom native artifacts distinct from signed official
-packages. Application CPU and native-source parity were checked on export;
-this source export does not activate a runtime or qualify a new GPU build.
+packages. Application CPU tests and native source checks were passed. The native upstream
+sync changes one Qwen generate.cpp comment and the CMake version; a fresh linked
+HIP build and GPU/workload checks remain pending. Source sync does not activate
+a runtime or qualify DeepSeek, Metal or SYCL changes.
 Merge/rebase upstream per component, run regressions and update the lock before
 tagging another fleet release. Branch names are development conveniences;
 builds and deployments use exact commits and image digests.
