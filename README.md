@@ -1,3 +1,5 @@
+> **mikenavi fleet fork:** see [README.fleet.md](README.fleet.md) for the pinned component, local changes, build and qualification limits.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="apps/host/public/brand/strata-lockup-dark.svg">

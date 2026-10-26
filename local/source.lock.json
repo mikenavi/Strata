@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "upstream": "https://github.com/Niko1221/Strata",
+  "upstream_base": "4b9e05a2a806a3fe24f7b2560d98626c37dade35",
+  "component": "strata-application",
+  "product_files": {
+    "serve/server.py": "699f768ecdc2f680ca0ac5a05fb20fe38ba8b57758beafecfec7c34c4bc91dca",
+    "serve/frontend.py": "14e1138af31d75f1bdf87a8406a41c8e066edd26bcfe75195ec2a39610f592be",
+    "serve/lifeline.py": "46412aeb7a4b8b92bc22bac07f3117e290ba95dcbe44f1a9b9e03c4638806c18",
+    "serve/test_logprobs.py": "e68edd735160a1c20bbcf319ebd39270c49f777ba2859128193612d55d101e83",
+    "serve/test_api_slots.py": "2a7470cc8103aebca4cdd3c446810ba2ac46aadbea14f8bb3cd613d0832cc754",
+    "serve/test_server.py": "8cbae5fe12fc0acb290c0ca4dbf5b09aa2f217f998cde043c694af09f751d368",
+    "serve/test_structured.py": "ba88f595e5d2d7288d70516c99185b0aaa014fd5b98d8693aa65fb5d9ad566f8",
+    "serve/test_monitor.py": "e3da398cd16fe2b45d3e3072fb59a79ba5ea3eff8fae3f986e2904f3848dd23c"
+  },
+  "source_only_export": true,
+  "target": "Linux gfx1151 with an external pinned ROCm toolchain",
+  "qualification": "Code bytes match a previously built artifact; this Git export is not a fresh GPU or workload qualification."
+}
